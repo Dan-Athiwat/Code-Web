@@ -104,8 +104,7 @@
         <button id="loginBtn" class="accent">เข้าสู่ระบบ</button>
       </div>
       <p class="muted">
-        ชื่ออย่างเดียวไม่ปลอดภัย เราเลยเพิ่ม PIN เพื่อป้องกันการยึดบัญชี
-        คุณสามารถแชร์บัญชีไปยังอุปกรณ์อื่นด้วย “Pair code” แบบครั้งเดียวด้านใน
+        กดเข้าสู่ระบบหรือสร้างบัญชีสำเร็จแล้วจะไปหน้าหลักทันที. แชร์บัญชีไปยังอุปกรณ์อื่นได้ด้วย Pair code.
       </p>
       <div class="row">
         <button id="createBtn" class="info">สร้างบัญชีใหม่</button>
@@ -194,7 +193,7 @@
   import { initializeApp } from "https://www.gstatic.com/firebasejs/11.0.1/firebase-app.js";
   import {
     getDatabase, ref, get, set, push, onValue, onChildAdded,
-    update, runTransaction, serverTimestamp, onDisconnect, remove, child
+    update, runTransaction, onDisconnect, remove
   } from "https://www.gstatic.com/firebasejs/11.0.1/firebase-database.js";
   import {
     getAuth, onAuthStateChanged, signInAnonymously, signOut
@@ -253,7 +252,7 @@
 
   // ===== State =====
   let currentUser = { uid: null, name: null };
-  let currentChatPeer = null; // peer uid
+  let currentChatPeer = null;
   let currentChatId = null;
 
   // WebRTC state
@@ -270,19 +269,16 @@
   const requestsRef = (uid) => ref(db, `friendRequests/${uid}`);
   const chatRef = (chatId) => ref(db, `chats/${chatId}/messages`);
   const presenceRef = (uid) => ref(db, `presence/${uid}`);
-  const callsRef = (chatId) => ref(db, `calls/${chatId}`);
   const pairCodeRef = (code) => ref(db, `pairCodes/${code}`);
+  const callsBaseRef = (chatId) => ref(db, `calls/${chatId}`);
 
-  const fmt = (ts) => {
-    try { return new Date(ts).toLocaleString(); } catch { return '' }
-  }
-  const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+  const fmt = (ts) => { try { return new Date(ts).toLocaleString(); } catch { return '' } };
   const withLoading = async (btn, fn) => {
     const oldDisabled = btn.disabled;
     btn.disabled = true; btn.classList.add('loading');
     try { return await fn(); } finally { btn.disabled = oldDisabled; btn.classList.remove('loading'); }
   };
-  const showToast = (msg, ms=2000) => {
+  const showToast = (msg, ms=1800) => {
     toastEl.textContent = msg; toastEl.style.display = 'block';
     setTimeout(() => { toastEl.style.display = 'none'; }, ms);
   };
@@ -292,7 +288,6 @@
     return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2,'0')).join('');
   };
 
-  // ===== Auth flow: username + PIN + pair code =====
   const startAnonymous = async () => {
     await signInAnonymously(auth);
     return new Promise((resolve) => {
@@ -306,11 +301,12 @@
     });
   };
 
+  // ===== Account creation and login (instant transition) =====
   const createAccount = async (name, pin) => {
     const uname = name.trim().toLowerCase();
     if (!uname || !pin || pin.length < 4) { showToast('กรอกชื่อและ PIN อย่างน้อย 4 หลัก'); return false; }
     const pinHash = await hashPIN(pin);
-    // Reserve username atomically
+
     const tx = await runTransaction(usernameIndexRef(uname), (cur) => {
       if (cur === null) return { reservedAt: Date.now() };
       return cur;
@@ -318,16 +314,19 @@
     if (!tx.committed || (tx.snapshot.val() && tx.snapshot.val().uid)) {
       showToast('ชื่อนี้มีคนใช้แล้ว'); return false;
     }
-    // Create anon auth session + user profile
+
     await startAnonymous();
     await set(userRef(currentUser.uid), { displayName: name.trim(), createdAt: Date.now(), lastChatPeer: null });
     await set(credsRef(uname), { pinHash, uid: currentUser.uid, at: Date.now() });
     await update(usernameIndexRef(uname), { uid: currentUser.uid });
     await set(presenceRef(currentUser.uid), { online: true, lastSeen: Date.now() });
     onDisconnect(presenceRef(currentUser.uid)).set({ online: false, lastSeen: Date.now() });
+
     currentUser.name = name.trim();
+
+    // Instant transition
     loginOverlay.style.display = 'none';
-    attachRealtimeListeners();
+    attachRealtimeListeners(true);
     showToast('สร้างบัญชีสำเร็จ');
     return true;
   };
@@ -340,47 +339,57 @@
     const creds = cSnap.val();
     if (!creds) { showToast('ไม่พบบัญชีชื่อนี้'); return false; }
     if (creds.pinHash !== pinHash) { showToast('PIN ไม่ถูกต้อง'); return false; }
+
     await startAnonymous();
-    currentUser.uid = creds.uid; // bind logical UID to this session
+    currentUser.uid = creds.uid; // bind session to logical account
     const uSnap = await get(userRef(currentUser.uid));
     currentUser.name = uSnap.val()?.displayName || name.trim();
     uidLabel.textContent = currentUser.uid;
+
     await set(presenceRef(currentUser.uid), { online: true, lastSeen: Date.now() });
     onDisconnect(presenceRef(currentUser.uid)).set({ online: false, lastSeen: Date.now() });
+
+    // Instant transition
     loginOverlay.style.display = 'none';
     attachRealtimeListeners(true);
     showToast('เข้าสู่ระบบสำเร็จ');
     return true;
   };
 
-  // Pair code: share account safely
+  // ===== Pair code (share account safely across devices) =====
   const genPairCode = async () => {
+    if (!currentUser.uid) { showToast('โปรดเข้าสู่ระบบก่อน'); return; }
     const code = Math.random().toString().slice(2,8); // 6 digits
     await set(pairCodeRef(code), { uid: currentUser.uid, expireAt: Date.now() + 5*60*1000 });
     pairCodeLabel.textContent = code;
     showToast('สร้างรหัสสำเร็จ');
   };
+
   const usePairCode = async (code) => {
+    if (!code) { showToast('กรอกรหัส Pair code'); return false; }
     const snap = await get(pairCodeRef(code));
     const data = snap.val();
     if (!data) { showToast('รหัสไม่ถูกต้อง'); return false; }
     if (Date.now() > data.expireAt) { showToast('รหัสหมดอายุ'); return false; }
+
     await startAnonymous();
     currentUser.uid = data.uid;
     const uSnap = await get(userRef(currentUser.uid));
     currentUser.name = uSnap.val()?.displayName || ('user_' + currentUser.uid.slice(-6));
     uidLabel.textContent = currentUser.uid;
+
     await set(presenceRef(currentUser.uid), { online: true, lastSeen: Date.now() });
     onDisconnect(presenceRef(currentUser.uid)).set({ online: false, lastSeen: Date.now() });
+
+    // Instant transition
     loginOverlay.style.display = 'none';
     attachRealtimeListeners(true);
-    // Consume code
-    await remove(pairCodeRef(code));
+    await remove(pairCodeRef(code)); // consume
     showToast('เชื่อมบัญชีสำเร็จ');
     return true;
   };
 
-  // ===== Lists and realtime =====
+  // ===== Friends and requests =====
   const renderListItem = (name, uid, actions = []) => {
     const div = document.createElement('div');
     div.className = 'item';
@@ -400,11 +409,15 @@
   };
 
   const attachRealtimeListeners = async (restore=false) => {
+    // Clear lists
+    friendsList.innerHTML = ''; requestsList.innerHTML = '';
+    let count = 0;
+
     // Load last chat peer
     const u = await get(userRef(currentUser.uid));
     const lastPeer = u.val()?.lastChatPeer || null;
 
-    // Incoming friend requests
+    // Requests
     onChildAdded(requestsRef(currentUser.uid), (snap) => {
       const fromUid = snap.key;
       get(userRef(fromUid)).then(s => {
@@ -418,9 +431,7 @@
       });
     });
 
-    // Friends list
-    friendsList.innerHTML = '';
-    let count = 0;
+    // Friends
     onChildAdded(friendsRef(currentUser.uid), (snap) => {
       const peerUid = snap.key;
       const status = snap.val()?.status;
@@ -484,7 +495,6 @@
     messagesEl.innerHTML = '';
     await update(userRef(currentUser.uid), { lastChatPeer: peerUid });
 
-    // Listen to messages
     onValue(chatRef(currentChatId), (snap) => {
       messagesEl.innerHTML = '';
       const msgs = snap.val() || {};
@@ -505,13 +515,13 @@
     if (!currentChatId) { showToast('โปรดเลือกเพื่อนเพื่อเริ่มแชท'); return; }
     const text = messageInput.value.trim();
     if (!text) { showToast('พิมพ์ข้อความก่อนส่ง'); return; }
-    sendBtn.disabled = true; sendBtn.classList.add('loading');
-    await push(chatRef(currentChatId), { from: currentUser.uid, text, at: Date.now() });
-    messageInput.value = '';
-    sendBtn.disabled = false; sendBtn.classList.remove('loading');
+    await withLoading(sendBtn, async () => {
+      await push(chatRef(currentChatId), { from: currentUser.uid, text, at: Date.now() });
+      messageInput.value = '';
+    });
   };
 
-  // ===== WebRTC calls (signaling via Firebase) =====
+  // ===== WebRTC calls =====
   const setupPeer = () => {
     pc = new RTCPeerConnection(rtcConfig);
     pc.ontrack = (e) => { remoteVideo.srcObject = e.streams[0]; };
@@ -539,6 +549,7 @@
 
   const listenForCalls = () => {
     if (!currentChatId) return;
+    const base = callsBaseRef(currentChatId);
     // Offers from peer
     onChildAdded(ref(db, `calls/${currentChatId}/offers`), async (snap) => {
       const offer = snap.val();
@@ -644,7 +655,7 @@
   logoutBtn.onclick = async () => {
     await withLoading(logoutBtn, async () => {
       await signOut(auth);
-      await set(presenceRef(currentUser.uid), { online: false, lastSeen: Date.now() });
+      if (currentUser.uid) await set(presenceRef(currentUser.uid), { online: false, lastSeen: Date.now() });
       loginOverlay.style.display = 'grid';
       showToast('ออกจากระบบแล้ว');
     });
@@ -658,8 +669,10 @@
   genPairCodeBtn.onclick = () => withLoading(genPairCodeBtn, genPairCode);
   usePairCodeBtn.onclick = () => withLoading(usePairCodeBtn, async () => {
     const code = pairCodeInput.value.trim();
-    if (!code) { showToast('กรอกรหัส Pair code'); return; }
-    await usePairCode(code);
+    const ok = await usePairCode(code);
+    if (!ok) return;
+    pairCodeInput.value = '';
+    pairCodeLabel.textContent = '';
   });
 
   // Restore local inputs for UX

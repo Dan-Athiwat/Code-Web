@@ -91,20 +91,20 @@
   <h1>Chat + Friends + Video</h1>
 </header>
 
-<!-- Login -->
+<!-- Login (instant transition) -->
 <div id="loginOverlay" aria-modal="true" role="dialog">
   <div id="loginCard">
     <h2>เข้าสู่ระบบด้วยชื่อ + PIN</h2>
     <div class="stack">
       <div class="row">
-        <input id="username" class="grow" placeholder="เช่น asus" autocomplete="username" />
+        <input id="username" class="grow" placeholder="เช่น asus หรืออีเมล" autocomplete="username" />
       </div>
       <div class="row">
         <input id="pin" class="grow" placeholder="PIN 6 หลัก" inputmode="numeric" maxlength="6" />
         <button id="loginBtn" class="accent">เข้าสู่ระบบ</button>
       </div>
       <p class="muted">
-        กดเข้าสู่ระบบหรือสร้างบัญชีสำเร็จแล้วจะไปหน้าหลักทันที. แชร์บัญชีไปยังอุปกรณ์อื่นได้ด้วย Pair code.
+        กดเข้าสู่ระบบหรือสร้างบัญชีสำเร็จแล้วจะไปหน้าหลักทันทีแบบไม่รอ. แชร์บัญชีไปยังอุปกรณ์อื่นได้ด้วย Pair code.
       </p>
       <div class="row">
         <button id="createBtn" class="info">สร้างบัญชีใหม่</button>
@@ -270,93 +270,90 @@
   const chatRef = (chatId) => ref(db, `chats/${chatId}/messages`);
   const presenceRef = (uid) => ref(db, `presence/${uid}`);
   const pairCodeRef = (code) => ref(db, `pairCodes/${code}`);
-  const callsBaseRef = (chatId) => ref(db, `calls/${chatId}`);
 
   const fmt = (ts) => { try { return new Date(ts).toLocaleString(); } catch { return '' } };
-  const withLoading = async (btn, fn) => {
-    const oldDisabled = btn.disabled;
-    btn.disabled = true; btn.classList.add('loading');
-    try { return await fn(); } finally { btn.disabled = oldDisabled; btn.classList.remove('loading'); }
-  };
-  const showToast = (msg, ms=1800) => {
-    toastEl.textContent = msg; toastEl.style.display = 'block';
-    setTimeout(() => { toastEl.style.display = 'none'; }, ms);
-  };
+  const showToast = (msg, ms=1600) => { toastEl.textContent = msg; toastEl.style.display = 'block'; setTimeout(() => { toastEl.style.display = 'none'; }, ms); };
   const hashPIN = async (pin) => {
     const enc = new TextEncoder().encode(pin);
     const buf = await crypto.subtle.digest('SHA-256', enc);
     return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2,'0')).join('');
   };
+  const optimisticGoMain = () => { loginOverlay.style.display = 'none'; }; // instant transition
+  const revertToLogin = (msg) => { loginOverlay.style.display = 'grid'; if (msg) showToast(msg); };
 
   const startAnonymous = async () => {
     await signInAnonymously(auth);
     return new Promise((resolve) => {
-      const unsub = onAuthStateChanged(auth, async (u) => {
-        if (!u) return;
-        currentUser.uid = u.uid;
-        uidLabel.textContent = currentUser.uid;
-        resolve(true);
-        unsub();
+      const unsub = onAuthStateChanged(auth, (u) => {
+        if (u) { currentUser.uid = u.uid; uidLabel.textContent = currentUser.uid; resolve(true); unsub(); }
       });
     });
   };
 
-  // ===== Account creation and login (instant transition) =====
+  // ===== Account creation and login (instant) =====
   const createAccount = async (name, pin) => {
     const uname = name.trim().toLowerCase();
     if (!uname || !pin || pin.length < 4) { showToast('กรอกชื่อและ PIN อย่างน้อย 4 หลัก'); return false; }
     const pinHash = await hashPIN(pin);
 
-    const tx = await runTransaction(usernameIndexRef(uname), (cur) => {
-      if (cur === null) return { reservedAt: Date.now() };
-      return cur;
-    });
-    if (!tx.committed || (tx.snapshot.val() && tx.snapshot.val().uid)) {
-      showToast('ชื่อนี้มีคนใช้แล้ว'); return false;
+    optimisticGoMain(); // move to next UI immediately
+
+    try {
+      const tx = await runTransaction(usernameIndexRef(uname), (cur) => {
+        if (cur === null) return { reservedAt: Date.now() };
+        return cur;
+      });
+      if (!tx.committed || (tx.snapshot.val() && tx.snapshot.val().uid)) {
+        revertToLogin('ชื่อนี้มีคนใช้แล้ว'); return false;
+      }
+
+      await startAnonymous();
+      await set(userRef(currentUser.uid), { displayName: name.trim(), createdAt: Date.now(), lastChatPeer: null });
+      await set(credsRef(uname), { pinHash, uid: currentUser.uid, at: Date.now() });
+      await update(usernameIndexRef(uname), { uid: currentUser.uid });
+      await set(presenceRef(currentUser.uid), { online: true, lastSeen: Date.now() });
+      onDisconnect(presenceRef(currentUser.uid)).set({ online: false, lastSeen: Date.now() });
+
+      currentUser.name = name.trim();
+      attachRealtimeListeners(true);
+      showToast('สร้างบัญชีสำเร็จ');
+      return true;
+    } catch (e) {
+      revertToLogin('สร้างบัญชีไม่สำเร็จ'); return false;
     }
-
-    await startAnonymous();
-    await set(userRef(currentUser.uid), { displayName: name.trim(), createdAt: Date.now(), lastChatPeer: null });
-    await set(credsRef(uname), { pinHash, uid: currentUser.uid, at: Date.now() });
-    await update(usernameIndexRef(uname), { uid: currentUser.uid });
-    await set(presenceRef(currentUser.uid), { online: true, lastSeen: Date.now() });
-    onDisconnect(presenceRef(currentUser.uid)).set({ online: false, lastSeen: Date.now() });
-
-    currentUser.name = name.trim();
-
-    // Instant transition
-    loginOverlay.style.display = 'none';
-    attachRealtimeListeners(true);
-    showToast('สร้างบัญชีสำเร็จ');
-    return true;
   };
 
   const loginAccount = async (name, pin) => {
     const uname = name.trim().toLowerCase();
     if (!uname || !pin) { showToast('กรอกชื่อและ PIN'); return false; }
-    const pinHash = await hashPIN(pin);
-    const cSnap = await get(credsRef(uname));
-    const creds = cSnap.val();
-    if (!creds) { showToast('ไม่พบบัญชีชื่อนี้'); return false; }
-    if (creds.pinHash !== pinHash) { showToast('PIN ไม่ถูกต้อง'); return false; }
 
-    await startAnonymous();
-    currentUser.uid = creds.uid; // bind session to logical account
-    const uSnap = await get(userRef(currentUser.uid));
-    currentUser.name = uSnap.val()?.displayName || name.trim();
-    uidLabel.textContent = currentUser.uid;
+    optimisticGoMain(); // move to next UI immediately
 
-    await set(presenceRef(currentUser.uid), { online: true, lastSeen: Date.now() });
-    onDisconnect(presenceRef(currentUser.uid)).set({ online: false, lastSeen: Date.now() });
+    try {
+      const pinHash = await hashPIN(pin);
+      const cSnap = await get(credsRef(uname));
+      const creds = cSnap.val();
+      if (!creds) { revertToLogin('ไม่พบบัญชีชื่อนี้'); return false; }
+      if (creds.pinHash !== pinHash) { revertToLogin('PIN ไม่ถูกต้อง'); return false; }
 
-    // Instant transition
-    loginOverlay.style.display = 'none';
-    attachRealtimeListeners(true);
-    showToast('เข้าสู่ระบบสำเร็จ');
-    return true;
+      await startAnonymous();
+      currentUser.uid = creds.uid;
+      const uSnap = await get(userRef(currentUser.uid));
+      currentUser.name = uSnap.val()?.displayName || name.trim();
+      uidLabel.textContent = currentUser.uid;
+
+      await set(presenceRef(currentUser.uid), { online: true, lastSeen: Date.now() });
+      onDisconnect(presenceRef(currentUser.uid)).set({ online: false, lastSeen: Date.now() });
+
+      attachRealtimeListeners(true);
+      showToast('เข้าสู่ระบบสำเร็จ');
+      return true;
+    } catch (e) {
+      revertToLogin('เข้าสู่ระบบไม่สำเร็จ'); return false;
+    }
   };
 
-  // ===== Pair code (share account safely across devices) =====
+  // ===== Pair code (cross-device) =====
   const genPairCode = async () => {
     if (!currentUser.uid) { showToast('โปรดเข้าสู่ระบบก่อน'); return; }
     const code = Math.random().toString().slice(2,8); // 6 digits
@@ -367,26 +364,29 @@
 
   const usePairCode = async (code) => {
     if (!code) { showToast('กรอกรหัส Pair code'); return false; }
-    const snap = await get(pairCodeRef(code));
-    const data = snap.val();
-    if (!data) { showToast('รหัสไม่ถูกต้อง'); return false; }
-    if (Date.now() > data.expireAt) { showToast('รหัสหมดอายุ'); return false; }
+    optimisticGoMain();
+    try {
+      const snap = await get(pairCodeRef(code));
+      const data = snap.val();
+      if (!data) { revertToLogin('รหัสไม่ถูกต้อง'); return false; }
+      if (Date.now() > data.expireAt) { revertToLogin('รหัสหมดอายุ'); return false; }
 
-    await startAnonymous();
-    currentUser.uid = data.uid;
-    const uSnap = await get(userRef(currentUser.uid));
-    currentUser.name = uSnap.val()?.displayName || ('user_' + currentUser.uid.slice(-6));
-    uidLabel.textContent = currentUser.uid;
+      await startAnonymous();
+      currentUser.uid = data.uid;
+      const uSnap = await get(userRef(currentUser.uid));
+      currentUser.name = uSnap.val()?.displayName || ('user_' + currentUser.uid.slice(-6));
+      uidLabel.textContent = currentUser.uid;
 
-    await set(presenceRef(currentUser.uid), { online: true, lastSeen: Date.now() });
-    onDisconnect(presenceRef(currentUser.uid)).set({ online: false, lastSeen: Date.now() });
+      await set(presenceRef(currentUser.uid), { online: true, lastSeen: Date.now() });
+      onDisconnect(presenceRef(currentUser.uid)).set({ online: false, lastSeen: Date.now() });
 
-    // Instant transition
-    loginOverlay.style.display = 'none';
-    attachRealtimeListeners(true);
-    await remove(pairCodeRef(code)); // consume
-    showToast('เชื่อมบัญชีสำเร็จ');
-    return true;
+      await remove(pairCodeRef(code));
+      attachRealtimeListeners(true);
+      showToast('เชื่อมบัญชีสำเร็จ');
+      return true;
+    } catch {
+      revertToLogin('เชื่อมบัญชีไม่สำเร็จ'); return false;
+    }
   };
 
   // ===== Friends and requests =====
@@ -400,7 +400,7 @@
       const btn = document.createElement('button');
       btn.textContent = a.label;
       if (a.class) btn.classList.add(a.class);
-      btn.onclick = async () => { await withLoading(btn, a.onClick); };
+      btn.onclick = async () => { btn.disabled = true; try { await a.onClick(); } finally { btn.disabled = false; } };
       right.appendChild(btn);
     });
     div.appendChild(left);
@@ -409,15 +409,12 @@
   };
 
   const attachRealtimeListeners = async (restore=false) => {
-    // Clear lists
     friendsList.innerHTML = ''; requestsList.innerHTML = '';
     let count = 0;
 
-    // Load last chat peer
     const u = await get(userRef(currentUser.uid));
     const lastPeer = u.val()?.lastChatPeer || null;
 
-    // Requests
     onChildAdded(requestsRef(currentUser.uid), (snap) => {
       const fromUid = snap.key;
       get(userRef(fromUid)).then(s => {
@@ -431,7 +428,6 @@
       });
     });
 
-    // Friends
     onChildAdded(friendsRef(currentUser.uid), (snap) => {
       const peerUid = snap.key;
       const status = snap.val()?.status;
@@ -515,10 +511,13 @@
     if (!currentChatId) { showToast('โปรดเลือกเพื่อนเพื่อเริ่มแชท'); return; }
     const text = messageInput.value.trim();
     if (!text) { showToast('พิมพ์ข้อความก่อนส่ง'); return; }
-    await withLoading(sendBtn, async () => {
+    sendBtn.disabled = true;
+    try {
       await push(chatRef(currentChatId), { from: currentUser.uid, text, at: Date.now() });
       messageInput.value = '';
-    });
+    } finally {
+      sendBtn.disabled = false;
+    }
   };
 
   // ===== WebRTC calls =====
@@ -549,8 +548,6 @@
 
   const listenForCalls = () => {
     if (!currentChatId) return;
-    const base = callsBaseRef(currentChatId);
-    // Offers from peer
     onChildAdded(ref(db, `calls/${currentChatId}/offers`), async (snap) => {
       const offer = snap.val();
       if (offer.to !== currentUser.uid) return;
@@ -570,7 +567,6 @@
       });
     });
 
-    // Answers to my offer
     onChildAdded(ref(db, `calls/${currentChatId}/answers`), async (snap) => {
       const ans = snap.val();
       if (ans.to !== currentUser.uid) return;
@@ -585,7 +581,8 @@
 
   const startCall = async () => {
     if (!currentChatPeer) { showToast('โปรดเปิดแชทกับเพื่อนก่อนเริ่มคอล'); return; }
-    await withLoading(startCallBtn, async () => {
+    startCallBtn.disabled = true;
+    try {
       await ensureMedia();
       setupPeer();
       localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
@@ -597,18 +594,23 @@
       callStatus.textContent = 'ส่งคำเชิญคอล...';
       hangupBtn.disabled = false;
       listenForCalls();
-    });
+    } finally {
+      startCallBtn.disabled = false;
+    }
   };
 
   const hangup = async () => {
-    await withLoading(hangupBtn, async () => {
+    hangupBtn.disabled = true;
+    try {
       try { pc?.getSenders()?.forEach(s => s.track?.stop()); } catch {}
       try { pc?.close(); } catch {}
       pc = null; localStream = null;
       localVideo.srcObject = null; remoteVideo.srcObject = null;
       callStatus.textContent = 'พร้อมคุย';
       if (currentChatId) await remove(ref(db, `calls/${currentChatId}`));
-    });
+    } finally {
+      hangupBtn.disabled = false;
+    }
   };
 
   const toggleMic = () => {
@@ -623,23 +625,22 @@
   };
 
   // ===== Events =====
-  loginBtn.onclick = () => withLoading(loginBtn, async () => {
-    loginStatus.textContent = 'กำลังเข้าสู่ระบบ...';
+  loginBtn.onclick = async () => {
+    loginBtn.disabled = true; createBtn.disabled = true;
     const ok = await loginAccount(usernameInput.value, pinInput.value);
-    if (!ok) loginStatus.textContent = 'เข้าสู่ระบบไม่สำเร็จ';
-    else loginStatus.textContent = '';
-  });
+    if (!ok) { loginBtn.disabled = false; createBtn.disabled = false; }
+  };
 
-  createBtn.onclick = () => withLoading(createBtn, async () => {
-    loginStatus.textContent = 'กำลังสร้างบัญชี...';
+  createBtn.onclick = async () => {
+    loginBtn.disabled = true; createBtn.disabled = true;
     const ok = await createAccount(usernameInput.value, pinInput.value);
-    if (!ok) loginStatus.textContent = 'สร้างบัญชีไม่สำเร็จ';
-    else loginStatus.textContent = '';
-  });
+    if (!ok) { loginBtn.disabled = false; createBtn.disabled = false; }
+  };
 
-  addFriendBtn.onclick = () => withLoading(addFriendBtn, async () => {
-    await sendFriendRequest(searchUserInput.value);
-  });
+  addFriendBtn.onclick = async () => {
+    addFriendBtn.disabled = true;
+    try { await sendFriendRequest(searchUserInput.value); } finally { addFriendBtn.disabled = false; }
+  };
 
   refreshFriendsBtn.onclick = async () => {
     friendsList.innerHTML = ''; friendsCount.textContent = '0 เพื่อน';
@@ -653,12 +654,15 @@
   });
 
   logoutBtn.onclick = async () => {
-    await withLoading(logoutBtn, async () => {
+    logoutBtn.disabled = true;
+    try {
       await signOut(auth);
       if (currentUser.uid) await set(presenceRef(currentUser.uid), { online: false, lastSeen: Date.now() });
-      loginOverlay.style.display = 'grid';
+      revertToLogin();
       showToast('ออกจากระบบแล้ว');
-    });
+    } finally {
+      logoutBtn.disabled = false;
+    }
   };
 
   startCallBtn.onclick = startCall;
@@ -666,14 +670,12 @@
   muteBtn.onclick = toggleMic;
   cameraBtn.onclick = toggleCam;
 
-  genPairCodeBtn.onclick = () => withLoading(genPairCodeBtn, genPairCode);
-  usePairCodeBtn.onclick = () => withLoading(usePairCodeBtn, async () => {
+  genPairCodeBtn.onclick = genPairCode;
+  usePairCodeBtn.onclick = async () => {
     const code = pairCodeInput.value.trim();
     const ok = await usePairCode(code);
-    if (!ok) return;
-    pairCodeInput.value = '';
-    pairCodeLabel.textContent = '';
-  });
+    if (ok) { pairCodeInput.value = ''; pairCodeLabel.textContent = ''; }
+  };
 
   // Restore local inputs for UX
   usernameInput.value = localStorage.getItem('lastUsername') || '';
